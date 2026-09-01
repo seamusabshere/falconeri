@@ -68,4 +68,3 @@ skip-tree = [
     # ring and prettytable-rs pull in older getrandom via redox_users
     { name = "getrandom", version = "0.2" },
 ]
-
