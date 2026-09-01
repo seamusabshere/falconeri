@@ -1,8 +1,8 @@
 //! Tools for talking to Kubernetes.
 
-use std::{collections::HashSet, env, iter, process::Stdio};
+use std::{collections::HashSet, env, fmt, iter, process::Stdio};
 
-use rand::{distr::Alphanumeric, rng, Rng};
+use rand::{distr::Alphanumeric, rng, RngExt};
 use serde::de::{Deserialize, DeserializeOwned};
 use serde_json;
 use tokio::{io::AsyncWriteExt, process::Command};
@@ -182,6 +182,21 @@ impl ResourceJson {
     fn is_running(&self) -> bool {
         self.phase() == Some("Running")
     }
+
+    /// Return the failure reported by Kubernetes, if any.
+    fn job_failure(&self) -> Option<K8sJobFailure> {
+        let status = self.status.as_ref()?;
+        let conditions = status.conditions.as_ref()?;
+        for condition in conditions {
+            if condition.condition_type == "Failed" && condition.status == "True" {
+                return Some(K8sJobFailure {
+                    reason: condition.reason.clone(),
+                    message: condition.message.clone(),
+                });
+            }
+        }
+        None
+    }
 }
 
 /// JSON describing resource metadata.
@@ -191,11 +206,27 @@ struct MetadataJson {
     name: Option<String>,
 }
 
-/// JSON describing resource metadata.
+/// JSON describing resource status.
 #[derive(Deserialize)]
 struct StatusJson {
-    /// Execution phase.
+    /// Execution phase (for pods).
     phase: Option<String>,
+    /// Status conditions (for jobs).
+    conditions: Option<Vec<ConditionJson>>,
+}
+
+/// JSON describing a status condition (used by K8s jobs).
+#[derive(Deserialize)]
+struct ConditionJson {
+    /// The type of condition (e.g., "Complete", "Failed").
+    #[serde(rename = "type")]
+    condition_type: String,
+    /// Whether the condition is "True", "False", or "Unknown".
+    status: String,
+    /// Machine-readable reason for the condition (e.g., "BackoffLimitExceeded").
+    reason: Option<String>,
+    /// Human-readable detail about the condition.
+    message: Option<String>,
 }
 
 /// Get a set of currently running pod names.
@@ -232,9 +263,52 @@ pub async fn get_running_pod_names() -> Result<HashSet<String>> {
     Ok(names)
 }
 
+/// Information about a K8s job's status.
+#[derive(Debug, Clone)]
+pub struct K8sJobInfo {
+    /// The job name.
+    pub name: String,
+    /// The terminal failure reported by Kubernetes.
+    pub failure: Option<K8sJobFailure>,
+}
+
+/// A terminal failure reported for a Kubernetes job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct K8sJobFailure {
+    /// The machine-readable reason, such as `BackoffLimitExceeded`.
+    pub reason: Option<String>,
+    /// Human-readable detail supplied by Kubernetes.
+    pub message: Option<String>,
+}
+
+impl fmt::Display for K8sJobFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.reason, &self.message) {
+            (Some(reason), Some(message)) => write!(
+                formatter,
+                "Kubernetes marked the job as failed ({reason}): {message}"
+            ),
+            (Some(reason), None) => {
+                write!(formatter, "Kubernetes marked the job as failed ({reason})")
+            }
+            (None, Some(message)) => {
+                write!(formatter, "Kubernetes marked the job as failed: {message}")
+            }
+            (None, None) => formatter.write_str("Kubernetes marked the job as failed"),
+        }
+    }
+}
+
 /// Get a set of all job names present on the cluster.
 #[instrument(level = "trace")]
 pub async fn get_all_job_names() -> Result<HashSet<String>> {
+    let job_infos = get_all_job_infos().await?;
+    Ok(job_infos.into_iter().map(|info| info.name).collect())
+}
+
+/// Get information about all jobs on the cluster, including their failure status.
+#[instrument(level = "trace")]
+pub async fn get_all_job_infos() -> Result<Vec<K8sJobInfo>> {
     let jobs = kubectl_parse_json::<ItemsJson<ResourceJson>>(&[
         "get",
         "jobs",
@@ -242,17 +316,24 @@ pub async fn get_all_job_names() -> Result<HashSet<String>> {
     ])
     .await?;
 
-    let mut names = HashSet::new();
+    let mut infos = Vec::new();
     for job in &jobs.items {
         if let Some(name) = job.name() {
-            names.insert(name.to_owned());
+            infos.push(K8sJobInfo {
+                name: name.to_owned(),
+                failure: job.job_failure(),
+            });
         } else {
             warn!("found nameless job");
         }
     }
-    debug!("found {} jobs", names.len());
-    trace!("jobs: {:?}", names);
-    Ok(names)
+    debug!(
+        "found {} jobs ({} failed)",
+        infos.len(),
+        infos.iter().filter(|info| info.failure.is_some()).count()
+    );
+    trace!("jobs: {:?}", infos);
+    Ok(infos)
 }
 
 /// Deploy a manifest to our Kubernetes cluster.
@@ -308,4 +389,82 @@ pub fn use_local_image() -> bool {
     env::var("FALCONERI_USE_LOCAL_IMAGE")
         .map(|v| v == "true" || v == "1")
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_failed_job_condition() {
+        let job: ResourceJson = serde_json::from_value(serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Failed",
+                    "status": "True",
+                    "reason": "BackoffLimitExceeded",
+                    "message": "Job has reached the specified backoff limit"
+                }]
+            }
+        }))
+        .expect("job JSON should parse");
+
+        assert_eq!(
+            job.job_failure(),
+            Some(K8sJobFailure {
+                reason: Some("BackoffLimitExceeded".to_owned()),
+                message: Some(
+                    "Job has reached the specified backoff limit".to_owned()
+                ),
+            })
+        );
+    }
+
+    #[test]
+    fn ignores_false_failed_job_condition() {
+        let job: ResourceJson = serde_json::from_value(serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Failed",
+                    "status": "False",
+                    "reason": "BackoffLimitExceeded"
+                }]
+            }
+        }))
+        .expect("job JSON should parse");
+
+        assert_eq!(job.job_failure(), None);
+    }
+
+    #[test]
+    fn handles_job_without_conditions() {
+        let job: ResourceJson = serde_json::from_value(serde_json::json!({
+            "status": {}
+        }))
+        .expect("job JSON should parse");
+
+        assert_eq!(job.job_failure(), None);
+    }
+
+    #[test]
+    fn handles_failed_job_without_reason() {
+        let job: ResourceJson = serde_json::from_value(serde_json::json!({
+            "status": {
+                "conditions": [{
+                    "type": "Failed",
+                    "status": "True",
+                    "message": "The job failed"
+                }]
+            }
+        }))
+        .expect("job JSON should parse");
+
+        assert_eq!(
+            job.job_failure(),
+            Some(K8sJobFailure {
+                reason: None,
+                message: Some("The job failed".to_owned()),
+            })
+        );
+    }
 }

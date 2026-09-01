@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0-alpha.8] - 2026-08-04
+
+### Fixed
+
+- Raise the worker injection init container's memory from 16 MiB to 64 MiB. The worker binary nearly filled the old limit, so copying it into the shared volume intermittently OOM-killed job pods and consumed their failed-pod budget.
+
+## [2.0.0-alpha.7] - 2026-08-04
+
+### Added
+
+- Pipeline specs accept `worker_failure_policy.maximum_counted_pod_failures`, which sets how many failed worker pods Kubernetes counts before failing the whole job.
+
+### Changed
+
+- Worker jobs no longer count pods lost to preemption, eviction or node drains against their failed-pod budget. This requires Kubernetes 1.26 or later.
+- The default failed-pod budget is now the greater of four pods or twice `parallelism_spec.constant`, rather than a flat four. Large jobs used to die on a handful of unrelated pod failures that Falconeri would have retried.
+- `job_timeout` now defaults to three days instead of being unlimited, so no job can run forever. A zero `job_timeout` is now rejected.
+
+### Fixed
+
+- `falconeri job retry` now recovers `datum_tries` and `job_timeout` from the original job. `falconerid` was storing a hand-built copy of the pipeline spec that omitted the first and wrote the second in a format it could not read back.
+
+## [2.0.0-alpha.6] - 2026-08-03
+
+### Fixed
+
+- falconerid: Detect Kubernetes jobs that fail in place (for example `BackoffLimitExceeded`) instead of only noticing when the Job object disappears. Jobs no longer stay stuck in `running` after Kubernetes has already marked them failed.
+- Persist Kubernetes failure reasons and messages on jobs, and show them in `falconeri job describe`.
+
+### Changed
+
+- CI release workflow now uses current GitHub Actions (`softprops/action-gh-release`, updated checkout/artifact actions) and publishes Docker images to `ghcr.io/<repository_owner>/falconeri`.
+
 ## [2.0.0-alpha.5] - 2026-01-15
 
 ### Added
